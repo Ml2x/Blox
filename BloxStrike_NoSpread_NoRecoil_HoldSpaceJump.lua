@@ -1,4 +1,4 @@
--- BloxStrike: two original remote loaders plus hold-Space auto jump.
+-- BloxStrike: No Spread + No Recoil loaders and game-controller hold-Space bhop.
 -- Run in a client executor after joining BloxStrike.
 
 if not game:IsLoaded() then
@@ -32,63 +32,229 @@ if state.jobId ~= game.JobId then
     state.jobId = game.JobId
 end
 
--- Re-execution replaces only our listeners. The two remote scripts change
--- functions in place, so loading them a second time would stack wrappers.
+-- Re-execution replaces our jump listener; weapon hooks stay single-load.
 if state.jumpConnection then state.jumpConnection:Disconnect() end
 if state.characterConnection then state.characterConnection:Disconnect() end
 state.generation = (state.generation or 0) + 1
 local generation = state.generation
 state.autoJumpEnabled = true
-state.humanoid = nil
 
-local function bindCharacter(character)
-    state.humanoid = nil
-    task.spawn(function()
-        local humanoid = character:WaitForChild("Humanoid", 10)
-        if state.generation == generation and player.Character == character then
-            state.humanoid = humanoid
-        end
-    end)
+local function startBhop()
+-- BloxStrike: повторный прыжок при удержании физического Space.
+-- Остановить: getgenv().BloxStrikeBhop.Stop()
+-- Состояние: getgenv().BloxStrikeBhop.Status()
+
+local G = getgenv()
+if G.BloxStrikeBhop and type(G.BloxStrikeBhop.Stop) == "function" then
+    G.BloxStrikeBhop.Stop()
 end
 
-state.characterConnection = player.CharacterAdded:Connect(bindCharacter)
-if player.Character then bindCharacter(player.Character) end
+if game.GameId ~= 7633926880 then
+    warn("[BloxStrikeBhop] Этот скрипт предназначен для BloxStrike")
+    return
+end
 
-state.jumpConnection = RunService.Heartbeat:Connect(function()
-    if not state.autoJumpEnabled
-        or not UserInputService:IsKeyDown(Enum.KeyCode.Space)
-        or UserInputService:GetFocusedTextBox() then
-        return
-    end
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local RS = game:GetService("ReplicatedStorage")
 
-    local humanoid = state.humanoid
-    if not humanoid or humanoid.Health <= 0 then return end
-    local currentState = humanoid:GetState()
-    if currentState == Enum.HumanoidStateType.Seated
-        or currentState == Enum.HumanoidStateType.Dead
-        or currentState == Enum.HumanoidStateType.Swimming then
-        return
-    end
-    if humanoid.FloorMaterial ~= Enum.Material.Air then
-        humanoid.Jump = true
-    end
+local ok, action = pcall(function()
+    return require(RS.Controllers.InputController.Actions.Jump)
 end)
+if not ok or type(action) ~= "table" or type(action.Callback) ~= "function" then
+    warn("[BloxStrikeBhop] Не найден обработчик прыжка игры")
+    return
+end
 
-function state.StopAutoJump()
-    state.autoJumpEnabled = false
-    if state.jumpConnection then state.jumpConnection:Disconnect() end
-    if state.characterConnection then state.characterConnection:Disconnect() end
-    state.jumpConnection = nil
-    state.characterConnection = nil
-    state.humanoid = nil
-    print("[BloxStrike Combo] Auto jump stopped; weapon hooks remain loaded.")
+local controller
+for i = 1, 12 do
+    local value = debug.getupvalue(action.Callback, i)
+    if type(value) == "table" and
+       type(value.jump) == "function" and
+       type(value.getCurrentCharacter) == "function" then
+        controller = value
+        break
+    end
+end
+if not controller then
+    warn("[BloxStrikeBhop] Не найден контроллер персонажа")
+    return
+end
+
+local state = {
+    running = true,
+    attempts = 0,
+    jumpsObserved = 0,
+    spaceDown = false,
+    onGround = false,
+    lastError = nil,
+}
+local connection
+local character
+local lastPulse = -math.huge
+local pulseHeld = false
+local awaitingAir = false
+local pendingPressAt = nil
+local wasDown = false
+local initialPhase = false
+local initialAt = 0
+local nativeReleaseAt = nil
+
+local function setJump(down)
+    local success, err = pcall(controller.jump, down)
+    if not success then
+        state.lastError = tostring(err)
+        warn("[BloxStrikeBhop] " .. state.lastError)
+        state.Stop()
+        return false
+    end
+    return true
+end
+
+function state.Stop()
+    if not state.running then return end
+    state.running = false
+    if connection then connection:Disconnect() end
+    if pulseHeld then
+        pcall(controller.jump, false)
+        pulseHeld = false
+    end
+    print("[BloxStrikeBhop] stopped", state.attempts, state.jumpsObserved)
 end
 
 function state.Status()
     return {
+        running = state.running,
+        attempts = state.attempts,
+        jumpsObserved = state.jumpsObserved,
+        spaceDown = state.spaceDown,
+        onGround = state.onGround,
+        lastError = state.lastError,
+    }
+end
+
+G.BloxStrikeBhop = state
+
+connection = RunService.Heartbeat:Connect(function()
+    local current = controller.getCurrentCharacter()
+    local down = UIS:IsKeyDown(Enum.KeyCode.Space)
+    local grounded = current ~= nil and current.OnGround == true
+    state.spaceDown = down
+    state.onGround = grounded
+
+    if current ~= character then
+        character = current
+        awaitingAir = false
+        pulseHeld = false
+        pendingPressAt = nil
+        wasDown = false
+        initialPhase = false
+        nativeReleaseAt = nil
+        lastPulse = -math.huge
+    end
+
+    if not down or not current then
+        pendingPressAt = nil
+        nativeReleaseAt = nil
+        initialPhase = false
+        wasDown = false
+        if pulseHeld then
+            setJump(false)
+            pulseHeld = false
+        end
+        awaitingAir = false
+        return
+    end
+
+    local now = os.clock()
+    if not wasDown then
+        -- Первый физический Space обрабатывает сама игра. Не гасим его.
+        wasDown = true
+        initialPhase = true
+        initialAt = now
+        lastPulse = now
+        return
+    end
+
+    if initialPhase then
+        if not grounded or current.IsJumping then
+            initialPhase = false
+            -- После отрыва отпускаем внутренний флаг, чтобы подготовить следующий прыжок.
+            nativeReleaseAt = now + 0.18
+        elseif now - initialAt < 0.18 then
+            return
+        else
+            -- Запасной путь, если обычный первый прыжок не зарегистрирован.
+            initialPhase = false
+        end
+    end
+
+    if nativeReleaseAt and now >= nativeReleaseAt then
+        if not setJump(false) then return end
+        nativeReleaseAt = nil
+    end
+
+    if awaitingAir and not grounded then
+        state.jumpsObserved = state.jumpsObserved + 1
+        awaitingAir = false
+    end
+
+    -- Отпускаем только внутренний флаг прыжка игры, не физическую клавишу.
+    if pulseHeld and now - lastPulse >= 0.13 then
+        if not setJump(false) then return end
+        pulseHeld = false
+    end
+
+    -- SetJumpInput должен увидеть отпускание отдельным кадром до нового импульса.
+    if pendingPressAt and now >= pendingPressAt then
+        pendingPressAt = nil
+        if not grounded then return end
+        if not setJump(true) then return end
+        lastPulse = now
+        pulseHeld = true
+        awaitingAir = true
+        state.attempts = state.attempts + 1
+    end
+
+    -- Повтор после приземления; ограничение частоты не даёт зациклиться на земле.
+    if grounded and not initialPhase and not pulseHeld and not pendingPressAt
+        and now - lastPulse >= 0.25 then
+        if current.JumpInputDown then
+            if not setJump(false) then return end
+            pendingPressAt = now + 0.03
+        else
+            if not setJump(true) then return end
+            lastPulse = now
+            pulseHeld = true
+            awaitingAir = true
+            state.attempts = state.attempts + 1
+        end
+    end
+end)
+
+print("[BloxStrikeBhop] controller-v3 running; hold Space; Stop()/Status() via getgenv().BloxStrikeBhop")
+
+end
+startBhop()
+function state.StopAutoJump()
+    state.autoJumpEnabled = false
+    local bhopState = environment.BloxStrikeBhop
+    if bhopState and type(bhopState.Stop) == 'function' then bhopState.Stop() end
+end
+
+function state.Status()
+    local bhopState = environment.BloxStrikeBhop
+    local jumpStatus = bhopState and bhopState.Status and bhopState.Status() or {}
+    return {
         noSpread = state.noSpreadLoaded,
         noRecoil = state.noRecoilLoaded,
-        autoJump = state.autoJumpEnabled,
+        autoJump = state.autoJumpEnabled and jumpStatus.running == true,
+        jumpMode = 'game controller',
+        jumpAttempts = jumpStatus.attempts or 0,
+        jumpsObserved = jumpStatus.jumpsObserved or 0,
+        spaceDown = jumpStatus.spaceDown or false,
+        onGround = jumpStatus.onGround or false,
+        jumpError = jumpStatus.lastError,
     }
 end
 
@@ -171,4 +337,4 @@ task.spawn(function()
     end
 end)
 
-print("[BloxStrike Combo] Hold Space to jump after each landing.")
+print("[BloxStrike Combo] Hold Space for bhop; first jump uses the normal game input.")
